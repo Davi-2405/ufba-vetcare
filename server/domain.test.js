@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, before } from "node:test";
@@ -48,6 +48,57 @@ test("schema cria tutores, animais e vínculo com o tutor", () => {
         foreignKey.on_delete === "RESTRICT",
     ),
   );
+});
+
+test("schema cria notificações associadas a usuário e agendamento", () => {
+  const columns = database.connection
+    .prepare("PRAGMA table_info(notifications)")
+    .all();
+
+  assert.deepEqual(
+    columns.map((column) => column.name),
+    [
+      "id",
+      "user_id",
+      "event_type",
+      "appointment_id",
+      "title",
+      "description",
+      "created_at",
+      "read_at",
+    ],
+  );
+  assert.equal(columns.find((column) => column.name === "user_id").notnull, 1);
+  assert.equal(columns.find((column) => column.name === "read_at").notnull, 0);
+
+  const foreignKeys = database.connection
+    .prepare("PRAGMA foreign_key_list(notifications)")
+    .all();
+
+  assert.ok(
+    foreignKeys.some(
+      (foreignKey) =>
+        foreignKey.table === "users" &&
+        foreignKey.from === "user_id" &&
+        foreignKey.on_delete === "CASCADE",
+    ),
+  );
+  assert.ok(
+    foreignKeys.some(
+      (foreignKey) =>
+        foreignKey.table === "appointments" &&
+        foreignKey.from === "appointment_id" &&
+        foreignKey.on_delete === "SET NULL",
+    ),
+  );
+
+  const indexes = database.connection
+    .prepare("PRAGMA index_list(notifications)")
+    .all()
+    .map((index) => index.name);
+
+  assert.ok(indexes.includes("idx_notifications_user_created_at"));
+  assert.ok(indexes.includes("idx_notifications_user_read_at"));
 });
 
 test("cadastra, consulta, filtra e atualiza tutores", () => {
@@ -295,7 +346,13 @@ test("migrations são versionadas e idempotentes", async () => {
     .prepare("PRAGMA user_version")
     .get().user_version;
 
-  assert.ok(firstVersion >= 2);
+  assert.ok(firstVersion >= 5);
+  const migrationSql = readFileSync(
+    new URL("./db/migrations/005_notifications.sql", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotThrow(() => first.connection.exec(migrationSql));
+  assert.doesNotThrow(() => first.connection.exec(migrationSql));
   first.close();
 
   const second = await openDatabase(options);
