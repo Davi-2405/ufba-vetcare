@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +29,19 @@ function loginRequest(email, password, headers = {}) {
 
 function sessionCookie(response) {
   return response.headers.getSetCookie()[0]?.split(";")[0] ?? "";
+}
+
+function getAppointmentNotifications(appointmentId) {
+  return database.connection
+    .prepare(
+      `SELECT n.id, n.user_id, n.event_type, n.appointment_id, n.title,
+              n.description, n.created_at, u.email
+       FROM notifications n
+       INNER JOIN users u ON u.id = n.user_id
+       WHERE n.appointment_id = ?
+       ORDER BY n.created_at ASC, n.id ASC`,
+    )
+    .all(appointmentId);
 }
 
 before(async () => {
@@ -853,6 +867,65 @@ test("API de agendamentos cobre CRUD, conflito, cancelamento e auditoria", async
 
   assert.ok(vet);
 
+  const receptionist = await database.createUser({
+    name: "Recepcionista da Agenda",
+    email: "recepcionista.agenda@vetcare.com",
+    password: "SenhaRecepcionista123!",
+    roleSlugs: ["recepcionista"],
+  });
+  const multiRoleUser = await database.createUser({
+    name: "Usuário Multiperfil da Agenda",
+    email: "multi.agenda@vetcare.com",
+    password: "SenhaMultiAgenda123!",
+    roleSlugs: ["recepcionista", "veterinario"],
+  });
+  const inactiveRecipient = await database.createUser({
+    name: "Usuário Inativo da Agenda",
+    email: "inativo.agenda@vetcare.com",
+    password: "SenhaInativoAgenda123!",
+    roleSlugs: ["recepcionista"],
+    isActive: false,
+  });
+  const observerRoleId = randomUUID();
+
+  database.connection
+    .prepare(
+      "INSERT INTO roles (id, slug, name, description) VALUES (?, ?, ?, ?)",
+    )
+    .run(
+      observerRoleId,
+      `agenda-observer-${observerRoleId}`,
+      "Observador da Agenda",
+      "Papel de teste sem permissão de notificações.",
+    );
+
+  const unauthorizedRecipient = await database.createUser({
+    name: "Usuário sem Permissão de Notificações",
+    email: "sem-permissao.agenda@vetcare.com",
+    password: "SenhaSemPermissao123!",
+    roleSlugs: [`agenda-observer-${observerRoleId}`],
+  });
+  const admin = database.getUserAuthByEmail(TEST_EMAIL);
+  const expectedRecipientIds = database.connection
+    .prepare(
+      `SELECT DISTINCT u.id
+       FROM users u
+       INNER JOIN user_roles ur ON ur.user_id = u.id
+       INNER JOIN role_permissions rp ON rp.role_id = ur.role_id
+       INNER JOIN permissions p ON p.id = rp.permission_id
+       WHERE u.is_active = 1 AND p.code = ?`,
+    )
+    .all("notifications.manage")
+    .map((user) => user.id)
+    .sort();
+
+  assert.ok(expectedRecipientIds.includes(admin.id));
+  assert.ok(expectedRecipientIds.includes(receptionist.id));
+  assert.ok(expectedRecipientIds.includes(vet.id));
+  assert.ok(expectedRecipientIds.includes(multiRoleUser.id));
+  assert.ok(!expectedRecipientIds.includes(inactiveRecipient.id));
+  assert.ok(!expectedRecipientIds.includes(unauthorizedRecipient.id));
+
   const tutor = database.createTutor({
     name: "Tutor da Agenda",
     cpf: "555.444.333-22",
@@ -902,6 +975,35 @@ test("API de agendamentos cobre CRUD, conflito, cancelamento e auditoria", async
   assert.equal(createBody.appointment.status, "scheduled");
 
   const appointmentId = createBody.appointment.id;
+  const createdNotifications = getAppointmentNotifications(appointmentId);
+
+  assert.equal(createdNotifications.length, expectedRecipientIds.length);
+  assert.deepEqual(
+    createdNotifications.map((notification) => notification.user_id).sort(),
+    expectedRecipientIds,
+  );
+  assert.equal(
+    new Set(createdNotifications.map((notification) => notification.user_id))
+      .size,
+    expectedRecipientIds.length,
+  );
+  assert.ok(
+    createdNotifications.every(
+      (notification) =>
+        notification.event_type === "appointment_created" &&
+        notification.title === "Novo agendamento: Pet da Agenda" &&
+        notification.description.includes("Tutor da Agenda") &&
+        notification.description.includes("Veterinária da Agenda") &&
+        notification.description.includes("2030-01-15T13:00:00.000Z"),
+    ),
+  );
+  assert.ok(
+    createdNotifications.every(
+      (notification) =>
+        notification.user_id !== inactiveRecipient.id &&
+        notification.user_id !== unauthorizedRecipient.id,
+    ),
+  );
 
   const listResponse = await fetch(
     `${baseUrl}/api/appointments?q=Pet%20da%20Agenda&type=consultation&status=scheduled&veterinarianId=${vet.id}`,
@@ -931,6 +1033,36 @@ test("API de agendamentos cobre CRUD, conflito, cancelamento e auditoria", async
 
   assert.equal(conflictResponse.status, 409);
   assert.equal(conflictBody.error.code, "appointment_conflict");
+  assert.equal(
+    getAppointmentNotifications(appointmentId).length,
+    expectedRecipientIds.length,
+  );
+
+  const noOpUpdateResponse = await fetch(
+    `${baseUrl}/api/appointments/${appointmentId}`,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        cookie: adminCookie,
+      },
+      body: JSON.stringify({
+        animalId: animal.id,
+        veterinarianId: vet.id,
+        type: "consultation",
+        scheduledAt: "2030-01-15T13:00:00.000Z",
+        durationMinutes: 30,
+        status: "scheduled",
+        notes: "Primeira consulta.",
+      }),
+    },
+  );
+
+  assert.equal(noOpUpdateResponse.status, 200);
+  assert.equal(
+    getAppointmentNotifications(appointmentId).length,
+    expectedRecipientIds.length,
+  );
 
   const updateResponse = await fetch(
     `${baseUrl}/api/appointments/${appointmentId}`,
@@ -955,6 +1087,15 @@ test("API de agendamentos cobre CRUD, conflito, cancelamento e auditoria", async
 
   assert.equal(updateResponse.status, 200);
   assert.equal(updateBody.appointment.type, "surgery");
+  const afterUpdateNotifications = getAppointmentNotifications(appointmentId);
+
+  assert.equal(afterUpdateNotifications.length, expectedRecipientIds.length * 2);
+  assert.equal(
+    afterUpdateNotifications.filter(
+      (notification) => notification.event_type === "appointment_updated",
+    ).length,
+    expectedRecipientIds.length,
+  );
 
   const cancelResponse = await fetch(
     `${baseUrl}/api/appointments/${appointmentId}/cancel`,
@@ -964,6 +1105,64 @@ test("API de agendamentos cobre CRUD, conflito, cancelamento e auditoria", async
 
   assert.equal(cancelResponse.status, 200);
   assert.equal(cancelBody.appointment.status, "cancelled");
+  const afterCancelNotifications = getAppointmentNotifications(appointmentId);
+
+  assert.equal(afterCancelNotifications.length, expectedRecipientIds.length * 3);
+  assert.equal(
+    afterCancelNotifications.filter(
+      (notification) =>
+        notification.event_type === "appointment_cancelled",
+    ).length,
+    expectedRecipientIds.length,
+  );
+
+  const notificationCountBeforeFailure = database.connection
+    .prepare("SELECT COUNT(*) AS total FROM notifications")
+    .get().total;
+  database.connection.exec(
+    `CREATE TRIGGER fail_notification_insert
+     BEFORE INSERT ON notifications
+     BEGIN
+       SELECT RAISE(ABORT, 'notification insert failed');
+     END;`,
+  );
+
+  let failedCreateResponse;
+
+  try {
+    failedCreateResponse = await fetch(`${baseUrl}/api/appointments`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        cookie: adminCookie,
+      },
+      body: JSON.stringify({
+        animalId: animal.id,
+        veterinarianId: vet.id,
+        type: "consultation",
+        scheduledAt: "2030-01-16T13:00:00.000Z",
+        durationMinutes: 30,
+      }),
+    });
+  } finally {
+    database.connection.exec("DROP TRIGGER fail_notification_insert;");
+  }
+
+  assert.equal(failedCreateResponse.status, 500);
+  assert.equal(
+    database.connection
+      .prepare(
+        "SELECT COUNT(*) AS total FROM appointments WHERE scheduled_at = ?",
+      )
+      .get("2030-01-16T13:00:00.000Z").total,
+    0,
+  );
+  assert.equal(
+    database.connection
+      .prepare("SELECT COUNT(*) AS total FROM notifications")
+      .get().total,
+    notificationCountBeforeFailure,
+  );
 
   const rebookResponse = await fetch(`${baseUrl}/api/appointments`, {
     method: "POST",
@@ -981,6 +1180,45 @@ test("API de agendamentos cobre CRUD, conflito, cancelamento e auditoria", async
   });
 
   assert.equal(rebookResponse.status, 201);
+  const rebookBody = await rebookResponse.json();
+  const rebookAppointment = rebookBody.appointment;
+
+  const cancelByUpdateResponse = await fetch(
+    `${baseUrl}/api/appointments/${rebookAppointment.id}`,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        cookie: adminCookie,
+      },
+      body: JSON.stringify({
+        animalId: animal.id,
+        veterinarianId: vet.id,
+        type: "vaccination",
+        scheduledAt: "2030-01-15T14:00:00.000Z",
+        durationMinutes: 60,
+        status: "cancelled",
+      }),
+    },
+  );
+
+  assert.equal(cancelByUpdateResponse.status, 200);
+  const cancelledByUpdateNotifications = getAppointmentNotifications(
+    rebookAppointment.id,
+  );
+  assert.equal(
+    cancelledByUpdateNotifications.filter(
+      (notification) =>
+        notification.event_type === "appointment_cancelled",
+    ).length,
+    expectedRecipientIds.length,
+  );
+  assert.equal(
+    cancelledByUpdateNotifications.filter(
+      (notification) => notification.event_type === "appointment_updated",
+    ).length,
+    0,
+  );
 
   const vaccinationList = await fetch(
     `${baseUrl}/api/appointments?type=vaccination`,
