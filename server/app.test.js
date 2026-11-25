@@ -72,6 +72,7 @@ test("seed cria admin com hash scrypt e todas as permissões", () => {
   assert.equal(admin.isActive, true);
   assert.equal(admin.roles.length, 1);
   assert.equal(admin.roles[0].slug, "administrador");
+  assert.ok(hasPermission(admin, "notifications.manage"));
   assert.match(admin.passwordHash, /^scrypt\$/);
   assert.notEqual(admin.passwordHash, TEST_PASSWORD);
   assert.deepEqual(
@@ -147,6 +148,7 @@ test("RBAC concede permissões por papel e nega as demais", async () => {
 
   assert.ok(hasPermission(receptionist, "appointments.write"));
   assert.ok(hasPermission(receptionist, "tutors.read"));
+  assert.ok(hasPermission(receptionist, "notifications.manage"));
   assert.equal(hasPermission(receptionist, "users.write"), false);
   assert.equal(hasPermission(receptionist, "medical_records.write"), false);
   assert.equal(hasPermission(receptionist, "audit.read"), false);
@@ -160,7 +162,23 @@ test("RBAC concede permissões por papel e nega as demais", async () => {
   assert.equal(response.status, 200);
   assert.equal(body.user.roles[0].slug, "recepcionista");
   assert.ok(body.user.permissions.includes("payments.write"));
+  assert.ok(body.user.permissions.includes("notifications.manage"));
   assert.ok(!body.user.permissions.includes("roles.write"));
+
+  const veterinarian = await database.createUser({
+    name: "Veterinário de Teste RBAC",
+    email: "veterinario-rbac@vetcare.com",
+    password: "SenhaVeterinario123!",
+    roleSlugs: ["veterinario"],
+  });
+
+  assert.ok(hasPermission(veterinarian, "notifications.manage"));
+
+  const userWithoutPermissions = { permissions: [] };
+  assert.equal(
+    hasPermission(userWithoutPermissions, "notifications.manage"),
+    false,
+  );
 
   const multiRole = await database.createUser({
     name: "Usuário com Dois Papéis",
