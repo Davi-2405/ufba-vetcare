@@ -44,6 +44,39 @@ function getAppointmentNotifications(appointmentId) {
     .all(appointmentId);
 }
 
+function insertNotificationFixture(userId, overrides = {}) {
+  const notification = {
+    id: randomUUID(),
+    eventType: "appointment_created",
+    appointmentId: null,
+    title: "Notificação de teste",
+    description: "Descrição de teste.",
+    createdAt: new Date().toISOString(),
+    readAt: null,
+    ...overrides,
+  };
+
+  database.connection
+    .prepare(
+      `INSERT INTO notifications
+         (id, user_id, event_type, appointment_id, title, description,
+          created_at, read_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      notification.id,
+      userId,
+      notification.eventType,
+      notification.appointmentId,
+      notification.title,
+      notification.description,
+      notification.createdAt,
+      notification.readAt,
+    );
+
+  return notification;
+}
+
 before(async () => {
   tempDir = mkdtempSync(join(tmpdir(), "vetcare-test-"));
   database = await openDatabase({
@@ -1685,4 +1718,240 @@ test("dashboard da clínica exige permissão e retorna indicadores agregados", a
     { headers: { cookie } },
   );
   assert.equal(invalid.status, 400);
+});
+
+test("API de notificações protege dados e ações por usuário autenticado", async () => {
+  const linkedTutor = database.createTutor({
+    name: "Tutor vinculado à notificação",
+  });
+  const linkedAnimal = database.createAnimal({
+    tutorId: linkedTutor.id,
+    name: "Animal vinculado à notificação",
+    species: "Cão",
+  });
+  const linkedVeterinarian = await database.createUser({
+    name: "Veterinário vinculado à notificação",
+    email: "notificacoes.linked.vet@vetcare.com",
+    password: "SenhaVetNotificacoes123!",
+    roleSlugs: ["veterinario"],
+  });
+  const linkedAppointment = database.createAppointment({
+    animalId: linkedAnimal.id,
+    veterinarianId: linkedVeterinarian.id,
+    type: "consultation",
+    scheduledAt: "2040-01-15T13:00:00.000Z",
+    durationMinutes: 30,
+  });
+  const owner = await database.createUser({
+    name: "Proprietário das Notificações",
+    email: "notificacoes.owner@vetcare.com",
+    password: "SenhaNotificacoes123!",
+    roleSlugs: ["recepcionista"],
+  });
+  const otherUser = await database.createUser({
+    name: "Outro Usuário de Notificações",
+    email: "notificacoes.other@vetcare.com",
+    password: "SenhaOutroUsuario123!",
+    roleSlugs: ["veterinario"],
+  });
+  const noPermissionRoleId = randomUUID();
+  const noPermissionRoleSlug = `notifications-reader-${noPermissionRoleId}`;
+
+  database.connection
+    .prepare(
+      "INSERT INTO roles (id, slug, name, description) VALUES (?, ?, ?, ?)",
+    )
+    .run(
+      noPermissionRoleId,
+      noPermissionRoleSlug,
+      "Usuário sem acesso às notificações",
+      "Papel de teste sem notifications.manage.",
+    );
+
+  const userWithoutPermission = await database.createUser({
+    name: "Usuário sem Acesso a Notificações",
+    email: "notificacoes.denied@vetcare.com",
+    password: "SenhaNegadaNotificacoes123!",
+    roleSlugs: [noPermissionRoleSlug],
+  });
+  const ownUnread = insertNotificationFixture(owner.id, {
+    title: "Notificação não lida",
+    appointmentId: linkedAppointment.id,
+  });
+  const ownUnreadForBulk = insertNotificationFixture(owner.id, {
+    title: "Notificação para leitura em lote",
+  });
+  const ownRead = insertNotificationFixture(owner.id, {
+    title: "Notificação já lida",
+    readAt: "2030-01-01T10:00:00.000Z",
+  });
+  const otherUnread = insertNotificationFixture(otherUser.id, {
+    title: "Notificação privada de outro usuário",
+  });
+  const ownerLogin = await loginRequest(
+    owner.email,
+    "SenhaNotificacoes123!",
+  );
+  const ownerCookie = sessionCookie(ownerLogin);
+  const otherLogin = await loginRequest(
+    otherUser.email,
+    "SenhaOutroUsuario123!",
+  );
+  const otherCookie = sessionCookie(otherLogin);
+  const deniedLogin = await loginRequest(
+    userWithoutPermission.email,
+    "SenhaNegadaNotificacoes123!",
+  );
+  const deniedCookie = sessionCookie(deniedLogin);
+
+  const unauthenticatedList = await fetch(`${baseUrl}/api/notifications`);
+  const unauthenticatedRead = await fetch(
+    `${baseUrl}/api/notifications/${ownUnread.id}/read`,
+    { method: "PATCH" },
+  );
+  const unauthenticatedReadAll = await fetch(
+    `${baseUrl}/api/notifications/read-all`,
+    { method: "POST" },
+  );
+
+  assert.equal(unauthenticatedList.status, 401);
+  assert.equal(unauthenticatedRead.status, 401);
+  assert.equal(unauthenticatedReadAll.status, 401);
+
+  const deniedList = await fetch(`${baseUrl}/api/notifications`, {
+    headers: { cookie: deniedCookie },
+  });
+  const deniedRead = await fetch(
+    `${baseUrl}/api/notifications/${ownUnread.id}/read`,
+    { method: "PATCH", headers: { cookie: deniedCookie } },
+  );
+  const deniedReadAll = await fetch(
+    `${baseUrl}/api/notifications/read-all`,
+    { method: "POST", headers: { cookie: deniedCookie } },
+  );
+
+  assert.equal(deniedList.status, 403);
+  assert.equal(deniedRead.status, 403);
+  assert.equal(deniedReadAll.status, 403);
+
+  const listResponse = await fetch(
+    `${baseUrl}/api/notifications?userId=${encodeURIComponent(otherUser.id)}`,
+    { headers: { cookie: ownerCookie } },
+  );
+  const listBody = await listResponse.json();
+
+  assert.equal(listResponse.status, 200);
+  assert.equal(listBody.unreadCount, 2);
+  assert.deepEqual(
+    listBody.notifications.map((notification) => notification.id).sort(),
+    [ownUnread.id, ownUnreadForBulk.id, ownRead.id].sort(),
+  );
+  assert.ok(
+    listBody.notifications.every(
+      (notification) =>
+        notification.userId === undefined &&
+        typeof notification.isRead === "boolean" &&
+        "readAt" in notification &&
+        "appointmentId" in notification,
+    ),
+  );
+  assert.equal(
+    listBody.notifications.find((item) => item.id === ownRead.id).isRead,
+    true,
+  );
+  assert.equal(
+    listBody.notifications.find((item) => item.id === ownUnread.id).isRead,
+    false,
+  );
+  const listedNotification = listBody.notifications.find(
+    (item) => item.id === ownUnread.id,
+  );
+  assert.equal(listedNotification.eventType, "appointment_created");
+  assert.equal(listedNotification.title, "Notificação não lida");
+  assert.equal(listedNotification.description, "Descrição de teste.");
+  assert.ok(listedNotification.createdAt);
+  assert.equal(listedNotification.appointmentId, linkedAppointment.id);
+
+  const markReadResponse = await fetch(
+    `${baseUrl}/api/notifications/${ownUnread.id}/read`,
+    { method: "PATCH", headers: { cookie: ownerCookie } },
+  );
+  const markReadBody = await markReadResponse.json();
+
+  assert.equal(markReadResponse.status, 200);
+  assert.equal(markReadBody.notification.id, ownUnread.id);
+  assert.equal(markReadBody.notification.isRead, true);
+  assert.ok(markReadBody.notification.readAt);
+
+  const accessOtherNotification = await fetch(
+    `${baseUrl}/api/notifications/${otherUnread.id}/read`,
+    { method: "PATCH", headers: { cookie: ownerCookie } },
+  );
+  assert.equal(accessOtherNotification.status, 404);
+
+  const missingNotification = await fetch(
+    `${baseUrl}/api/notifications/${randomUUID()}/read`,
+    { method: "PATCH", headers: { cookie: ownerCookie } },
+  );
+  assert.equal(missingNotification.status, 404);
+
+  const otherListAfterAttempt = await fetch(
+    `${baseUrl}/api/notifications`,
+    { headers: { cookie: otherCookie } },
+  );
+  const otherListBody = await otherListAfterAttempt.json();
+
+  assert.equal(otherListAfterAttempt.status, 200);
+  assert.equal(otherListBody.unreadCount, 1);
+  assert.equal(otherListBody.notifications.length, 1);
+  assert.equal(otherListBody.notifications[0].id, otherUnread.id);
+  assert.equal(otherListBody.notifications[0].isRead, false);
+
+  const markAllResponse = await fetch(
+    `${baseUrl}/api/notifications/read-all`,
+    { method: "POST", headers: { cookie: ownerCookie } },
+  );
+  const markAllBody = await markAllResponse.json();
+
+  assert.equal(markAllResponse.status, 200);
+  assert.equal(markAllBody.updatedCount, 1);
+
+  const listAfterMarkAll = await fetch(`${baseUrl}/api/notifications`, {
+    headers: { cookie: ownerCookie },
+  });
+  const listAfterMarkAllBody = await listAfterMarkAll.json();
+
+  assert.equal(listAfterMarkAllBody.unreadCount, 0);
+  assert.ok(listAfterMarkAllBody.notifications.every((item) => item.isRead));
+
+  const logoutResponse = await fetch(`${baseUrl}/api/auth/logout`, {
+    method: "POST",
+    headers: { cookie: ownerCookie },
+  });
+  assert.equal(logoutResponse.status, 204);
+
+  const reauthenticatedLogin = await loginRequest(
+    owner.email,
+    "SenhaNotificacoes123!",
+  );
+  const reauthenticatedCookie = sessionCookie(reauthenticatedLogin);
+  const persistedListResponse = await fetch(`${baseUrl}/api/notifications`, {
+    headers: { cookie: reauthenticatedCookie },
+  });
+  const persistedListBody = await persistedListResponse.json();
+
+  assert.equal(persistedListResponse.status, 200);
+  assert.equal(persistedListBody.unreadCount, 0);
+  assert.ok(persistedListBody.notifications.every((item) => item.isRead));
+  assert.equal(
+    persistedListBody.notifications.find((item) => item.id === ownUnread.id)
+      .readAt,
+    markReadBody.notification.readAt,
+  );
+
+  const otherListAfterOwnerReadAll = await fetch(
+    `${baseUrl}/api/notifications`,
+    { headers: { cookie: otherCookie } },
+  );
+  assert.equal((await otherListAfterOwnerReadAll.json()).unreadCount, 1);
 });
